@@ -1,0 +1,24 @@
+[package]
+name = "midi-access-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Pure core for MIDI device access crates: the Device trait, parameter metadata, catalogs, name resolution, codec helpers, and JSON Schema."
+
+[features]
+default = []
+# Adds Tsify derives on the shared serializable helper types so device crates
+# can render them in a generated `.d.ts`. Enabled by a device's wasm crate.
+tsify = ["dep:tsify-next", "dep:wasm-bindgen"]
+# Adds the `schema_json` helper + schemars derives. Enabled by a device's CLI.
+schema = ["dep:schemars", "dep:serde_json"]
+
+[dependencies]
+thiserror = { workspace = true }
+serde = { workspace = true }
+serde_yaml = { workspace = true }
+tsify-next = { workspace = true, optional = true }
+wasm-bindgen = { workspace = true, optional = true }
+schemars = { workspace = true, optional = true }
+serde_json = { workspace = true, optional = true }
