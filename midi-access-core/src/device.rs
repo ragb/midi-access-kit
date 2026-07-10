@@ -146,6 +146,44 @@ pub trait Device {
         None
     }
 
+    /// Frames that make the device **load** a stored patch (`dest` — the same
+    /// opaque slot string [`store`](Device::store) takes) into working memory:
+    /// the host-side equivalent of turning the panel dial. Each returned
+    /// `Vec<u8>` is one complete message (channel-voice *or* SysEx), and the
+    /// engine sends them **in order** — Yamaha gear, for one, only acts on a
+    /// latched Bank Select once the Program Change arrives.
+    ///
+    /// Unlike [`store`](Device::store), which returns concatenated `F0…F7`
+    /// frames, recall messages may be short channel-voice ones with no SysEx
+    /// delimiters, so they are returned pre-split rather than packed into one
+    /// buffer.
+    ///
+    /// `channel` is the 1-based MIDI channel (1..=16) to address, resolved by
+    /// the engine — see [`recall_channel_area`](Device::recall_channel_area)
+    /// and [`recall_channel`](Device::recall_channel).
+    ///
+    /// Returns `None` (the default) when the device cannot recall a slot over
+    /// MIDI — the mirror of `store`'s `None`.
+    fn recall(_dest: &str, _channel: u8) -> Option<Result<Vec<Vec<u8>>, DeviceError>> {
+        None
+    }
+
+    /// The area to dump to discover the MIDI channel [`recall`](Device::recall)
+    /// should address (e.g. the global/system document that holds the receive
+    /// channel). `None` (the default) means the engine addresses the channel it
+    /// was given directly, with no auto-detection round-trip.
+    fn recall_channel_area() -> Option<&'static str> {
+        None
+    }
+
+    /// The 1-based MIDI channel (1..=16) [`recall`](Device::recall) should
+    /// address, read from a decoded
+    /// [`recall_channel_area`](Device::recall_channel_area) document. `None`
+    /// falls back to the channel the engine was given.
+    fn recall_channel(_doc: &Value) -> Option<u8> {
+        None
+    }
+
     /// Classify an inbound MIDI byte sequence.
     fn classify_inbound(bytes: &[u8]) -> Inbound;
 

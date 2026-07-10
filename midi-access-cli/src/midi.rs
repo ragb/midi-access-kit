@@ -18,6 +18,11 @@ use midi_access_core::codec::split_sysex;
 const SYSEX_START: u8 = 0xF0;
 const SYSEX_END: u8 = 0xF7;
 
+/// Delay inserted between consecutive SysEx frames in [`MidiSession::send_sysex`]
+/// so a device isn't overrun mid bulk-dump. Small enough to be imperceptible on
+/// a multi-block dump, large enough for the device to accept each frame.
+const FRAME_GAP: Duration = Duration::from_millis(8);
+
 /// midir's backend errors are stringified at the boundary so ours stays
 /// `Send + Sync + 'static`.
 #[derive(Debug, Error)]
@@ -127,9 +132,29 @@ impl MidiSession {
 
     /// Send one or more complete SysEx frames packed in `bytes` (each `F0…F7`),
     /// transmitting each frame individually.
+    ///
+    /// Frames are paced by [`FRAME_GAP`]: hardware receiving a multi-block bulk
+    /// dump (header → many content blocks → footer) can drop frames or fail to
+    /// finalize its edit buffer if they arrive with no gap, which corrupts the
+    /// result. A few ms between frames costs nothing and keeps dumps intact.
     pub fn send_sysex(&mut self, bytes: &[u8]) -> Result<(), MidiError> {
-        for frame in split_sysex(bytes) {
+        for (i, frame) in split_sysex(bytes).into_iter().enumerate() {
+            if i > 0 {
+                std::thread::sleep(FRAME_GAP);
+            }
             self.send_frame(&frame)?;
+        }
+        Ok(())
+    }
+
+    /// Send a sequence of already-framed messages verbatim, in order. Unlike
+    /// [`send_sysex`](Self::send_sysex), the frames are not `F0…F7`-delimited —
+    /// each is transmitted as-is — so this carries short channel-voice messages
+    /// (Bank Select, Program Change) as well as SysEx. Used to recall a stored
+    /// patch.
+    pub fn send_messages(&mut self, frames: &[Vec<u8>]) -> Result<(), MidiError> {
+        for frame in frames {
+            self.send_frame(frame)?;
         }
         Ok(())
     }

@@ -23,6 +23,9 @@ use crate::{midi, yaml_io};
 const SETTLE: Duration = Duration::from_millis(600);
 const OVERALL: Duration = Duration::from_millis(2500);
 const IDENTITY_SETTLE: Duration = Duration::from_millis(300);
+/// Pause after a `sync` write, before a `--store`, so the device finishes
+/// applying the (possibly multi-block) dump before it commits to flash.
+const STORE_SETTLE: Duration = Duration::from_millis(500);
 
 /// Global options, shared by every subcommand.
 #[derive(Parser, Debug)]
@@ -84,6 +87,19 @@ enum Command {
         /// slot `20-8`); omit the value to store in place.
         #[arg(long, value_name = "DEST")]
         store: Option<Option<String>>,
+    },
+    /// Load a stored patch into the device's working memory (Bank Select +
+    /// Program Change), the host-side equivalent of turning the panel dial.
+    ///
+    /// The device streams nothing back automatically — follow with `dump` to
+    /// read the now-active patch. Not every device supports this.
+    Load {
+        /// Which stored slot to recall (device-specific, e.g. `20-8`).
+        dest: String,
+        /// MIDI channel (1..=16) to address. Auto-detected from the device when
+        /// omitted (falling back to channel 1).
+        #[arg(long)]
+        channel: Option<u8>,
     },
     /// Pretty-print a YAML file, identifying its kind (no device needed).
     Show { path: PathBuf },
@@ -162,6 +178,9 @@ fn dispatch<D: Device>(cli: Cli) -> i32 {
         } => with_session(&out, &session_args, |s| {
             sync::<D>(&out, s, &area, &input, verify, store.as_ref())
         }),
+        Command::Load { dest, channel } => {
+            with_session(&out, &session_args, |s| load::<D>(&out, s, &dest, channel))
+        }
         Command::Show { path } => show::<D>(&path),
         Command::Lint { path } => lint::<D>(&out, &path),
         Command::Diff { left, right } => diff::<D>(&out, &left, &right),
@@ -370,6 +389,10 @@ fn sync<D: Device>(
                 return dev_err_code(&e);
             }
             Some(Ok(bytes)) => {
+                // Let the device finish applying the bulk dump (a "store" that
+                // races the dump's finalization can commit an incomplete or
+                // just-cleared edit buffer — corrupting the target slot).
+                std::thread::sleep(STORE_SETTLE);
                 if let Err(e) = s.send_sysex(&bytes) {
                     out.error(format!("{e}"));
                     return DEVICE_UNAVAILABLE;
@@ -420,6 +443,63 @@ fn sync<D: Device>(
         }
     }
     OK
+}
+
+/// Recall a stored patch into the device's working memory: resolve the MIDI
+/// channel (explicit `--channel`, else auto-detected from the device), ask the
+/// device for the recall frames, and send them.
+fn load<D: Device>(out: &Out, s: &mut MidiSession, dest: &str, channel: Option<u8>) -> i32 {
+    let channel = match channel {
+        Some(c) => c,
+        None => detect_recall_channel::<D>(out, s),
+    };
+    match D::recall(dest, channel) {
+        None => {
+            out.error(format!("device {:?} has no load/recall operation", D::NAME));
+            USAGE_ERROR
+        }
+        Some(Err(e)) => {
+            out.error(format!("{e}"));
+            dev_err_code(&e)
+        }
+        Some(Ok(frames)) => {
+            if let Err(e) = s.send_messages(&frames) {
+                out.error(format!("{e}"));
+                return DEVICE_UNAVAILABLE;
+            }
+            out.info(format!(
+                "loaded {dest} on MIDI channel {channel} — `dump` to read the active patch"
+            ));
+            OK
+        }
+    }
+}
+
+/// The MIDI channel a recall should address: dump the device's
+/// [`recall_channel_area`](Device::recall_channel_area), decode it, and read the
+/// channel out. Any misstep (no such area, no reply, undecodable, no channel
+/// field) falls back to channel 1 — the same default the editor uses for a
+/// device configured to receive on all channels.
+fn detect_recall_channel<D: Device>(out: &Out, s: &mut MidiSession) -> u8 {
+    let Some(area) = D::recall_channel_area() else {
+        return 1;
+    };
+    let detected = D::request(area, s.device)
+        .ok()
+        .and_then(|req| s.request_collect(&req, SETTLE, OVERALL).ok())
+        .filter(|raw| !raw.is_empty())
+        .and_then(|raw| D::decode(area, &raw).ok())
+        .and_then(|doc| D::recall_channel(&doc));
+    match detected {
+        Some(ch) => {
+            out.info(format!("using MIDI channel {ch} (from {area})"));
+            ch
+        }
+        None => {
+            out.info("could not detect MIDI channel; assuming channel 1");
+            1
+        }
+    }
 }
 
 fn show<D: Device>(path: &Path) -> i32 {
@@ -810,6 +890,27 @@ mod tests {
     #[test]
     fn unknown_subcommand_is_clap_error() {
         assert!(try_run::<Fake>(["fake", "frobnicate"]).is_err());
+    }
+
+    #[test]
+    fn load_parses_and_needs_a_port() {
+        // `load` needs a session; with no --port the engine reports a usage
+        // error before ever touching MIDI (so this covers arg parsing too).
+        assert_eq!(
+            try_run::<Fake>(["fake", "load", "20-8"]).unwrap(),
+            USAGE_ERROR
+        );
+        assert_eq!(
+            try_run::<Fake>(["fake", "load", "20-8", "--channel", "5"]).unwrap(),
+            USAGE_ERROR
+        );
+    }
+
+    #[test]
+    fn recall_defaults_to_none_for_a_device_without_it() {
+        // Fake doesn't override recall, so it can't load slots over MIDI.
+        assert!(Fake::recall("20-8", 1).is_none());
+        assert!(Fake::recall_channel_area().is_none());
     }
 
     #[test]
