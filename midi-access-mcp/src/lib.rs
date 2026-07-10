@@ -164,10 +164,15 @@ pub struct DumpArgs {
 pub struct SyncArgs {
     /// Which area to write, e.g. `"live-set"`.
     pub area: String,
-    /// The document, as YAML or JSON. May be partial (it is merged over the
-    /// factory default) and may use value names (they are resolved for you).
+    /// The document, as YAML or JSON. Value names are resolved for you.
+    ///
+    /// A partial document is merged over the FACTORY DEFAULT — not over the patch
+    /// currently on the device — so unmentioned fields are reset. To edit the
+    /// loaded patch, `dump` it and sync back the whole edited document.
     pub document: String,
-    /// Read the area back afterwards and confirm it matches. Recommended.
+    /// Read the area back afterwards and confirm the device took it. Recommended:
+    /// a device may silently normalize a value whose enabling switch is off, and
+    /// only a read-back reveals that.
     pub verify: Option<bool>,
     /// Also commit the write to persistent storage at this destination, e.g. the
     /// CK's `"20-8"` (page-sound). DESTRUCTIVE: overwrites that saved slot for
@@ -290,8 +295,10 @@ port name if `dump`/`sync` report that no port is configured.")]
 
     #[tool(description = "\
 Read an area off the connected device and return it as YAML — the device's current \
-state. This is how you edit the patch that is loaded right now: dump it, change what \
-the user asked for, then sync it back. Read-only with respect to the device.")]
+state. This is how you edit the patch that is loaded right now: dump it, change only \
+what the user asked for in the returned document, then `sync` that whole document \
+back. Do not hand `sync` a few lines instead — a partial document is merged over the \
+factory default and would reset everything else. Read-only with respect to the device.")]
     pub async fn dump(
         &self,
         Parameters(args): Parameters<DumpArgs>,
@@ -301,10 +308,16 @@ the user asked for, then sync it back. Read-only with respect to the device.")]
     }
 
     #[tool(description = "\
-Write a document to the connected device. The document may be partial (it is merged \
-over the factory default) and may use value names (resolved automatically). \
+Write a document to the connected device. Value names are resolved for you. \
+\n\nIMPORTANT: a partial document is merged over the device's FACTORY DEFAULT, not \
+over the patch currently loaded. Sending a few lines therefore RESETS every field you \
+did not mention. To edit the patch the user has loaded right now, call `dump` first, \
+change the fields you want in the document it returns, and sync that whole document \
+back. Send a partial document only when building a preset from factory defaults. \
 \n\nBy default this writes only the device's working memory: audible immediately, \
-discarded on a power cycle. Pass `verify` to read it back and confirm. \
+discarded on a power cycle. Pass `verify` to read it back and confirm the device \
+actually took it — a device may silently normalize a value whose enabling switch is \
+off (e.g. an effect type while that effect is bypassed). \
 \n\nPass `store` ONLY when the user explicitly asked to save to a slot — it \
 permanently overwrites that saved slot. Prefer syncing without `store` so the user \
 can audition the sound first.")]
