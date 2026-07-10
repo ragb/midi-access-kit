@@ -41,12 +41,17 @@
 //! - `schema://{area}` — the area's JSON Schema.
 //! - `defaults://{area}` — the area's factory-default document.
 //!
-//! ## Safety
+//! ## Device I/O
 //!
-//! This server is **read-only**: it never opens a MIDI port and cannot write to
-//! hardware. Authoring and validation are pure functions over the device's codec.
-//! Sending a preset to a device — and especially storing it, which permanently
-//! overwrites a saved slot — stays in the CLI, where a human runs it deliberately.
+//! Given a [`MidiConfig`] with a port, three more tools reach the hardware:
+//! `list_ports`, `dump` (read an area — the entry point for "edit the patch I have
+//! loaded right now"), and `sync` (write it back, optionally `verify`ing the
+//! read-back).
+//!
+//! `sync` writes the device's **working memory** by default: audible immediately,
+//! discarded on a power cycle. Committing to a saved slot is a separate, explicit
+//! `store` argument, because it overwrites that slot for good. Start the server
+//! with `read_only` to refuse writes entirely.
 
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
@@ -63,24 +68,48 @@ use serde::Deserialize;
 use midi_access_core::Device;
 
 mod handle;
-pub use handle::DeviceHandle;
+pub use handle::{DeviceHandle, MidiConfig};
 
-/// Run the MCP server for `D` on stdio, blocking until the client disconnects.
+/// Run the MCP server for `D` on stdio with no MIDI port configured — the
+/// offline authoring tools only. Blocks until the client disconnects.
+pub fn serve<D: Device>() -> anyhow::Result<()> {
+    serve_with::<D>(MidiConfig::default())
+}
+
+/// Run the MCP server for `D` on stdio, reaching the hardware through `midi`.
 ///
 /// Builds its own tokio runtime, so a device crate's `main` needs no async setup.
-pub fn serve<D: Device>() -> anyhow::Result<()> {
+pub fn serve_with<D: Device>(midi: MidiConfig) -> anyhow::Result<()> {
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
-    rt.block_on(serve_async::<D>())
+    rt.block_on(serve_async::<D>(midi))
 }
 
 /// Run the MCP server for `D` on stdio inside an existing tokio runtime.
-pub async fn serve_async<D: Device>() -> anyhow::Result<()> {
-    let server = MidiAccessServer::new(DeviceHandle::of::<D>());
+pub async fn serve_async<D: Device>(midi: MidiConfig) -> anyhow::Result<()> {
+    let server = MidiAccessServer::new(DeviceHandle::of::<D>().with_midi(midi));
     let service = server.serve(rmcp::transport::stdio()).await?;
     service.waiting().await?;
     Ok(())
+}
+
+/// Run a blocking MIDI operation off the async runtime, mapping either failure
+/// into a tool-level error the caller can read.
+async fn blocking<T, F>(f: F) -> Result<CallToolResult, McpError>
+where
+    T: serde::Serialize + Send + 'static,
+    F: FnOnce() -> Result<T, String> + Send + 'static,
+{
+    match tokio::task::spawn_blocking(f).await {
+        Ok(Ok(v)) => Ok(CallToolResult::structured(
+            serde_json::to_value(v).unwrap_or(serde_json::Value::Null),
+        )),
+        Ok(Err(e)) => Ok(CallToolResult::error(vec![ContentBlock::text(e)])),
+        Err(join) => Ok(CallToolResult::error(vec![ContentBlock::text(format!(
+            "MIDI task panicked: {join}"
+        ))])),
+    }
 }
 
 // === tool arguments ===
@@ -123,6 +152,28 @@ pub struct ValidateArgs {
 pub struct ResolveNamesArgs {
     /// A document (possibly partial) using value *names*, as YAML or JSON.
     pub document: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct DumpArgs {
+    /// Which area to read off the device, e.g. `"live-set"`.
+    pub area: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct SyncArgs {
+    /// Which area to write, e.g. `"live-set"`.
+    pub area: String,
+    /// The document, as YAML or JSON. May be partial (it is merged over the
+    /// factory default) and may use value names (they are resolved for you).
+    pub document: String,
+    /// Read the area back afterwards and confirm it matches. Recommended.
+    pub verify: Option<bool>,
+    /// Also commit the write to persistent storage at this destination, e.g. the
+    /// CK's `"20-8"` (page-sound). DESTRUCTIVE: overwrites that saved slot for
+    /// good. Omit to leave the device's working memory only, which a power cycle
+    /// discards. Only set this when the user explicitly asked to save to a slot.
+    pub store: Option<String>,
 }
 
 // === server ===
@@ -220,6 +271,58 @@ call this, then validate.")]
             Err(e) => Ok(CallToolResult::error(vec![ContentBlock::text(e)])),
         }
     }
+
+    // === device I/O ===
+
+    #[tool(description = "\
+List the MIDI input and output ports on this machine. Use it to find the device's \
+port name if `dump`/`sync` report that no port is configured.")]
+    pub async fn list_ports(&self) -> Result<CallToolResult, McpError> {
+        blocking(|| {
+            midi_access_cli::midi::port_names()
+                .map(
+                    |(inputs, outputs)| serde_json::json!({ "inputs": inputs, "outputs": outputs }),
+                )
+                .map_err(|e| e.to_string())
+        })
+        .await
+    }
+
+    #[tool(description = "\
+Read an area off the connected device and return it as YAML — the device's current \
+state. This is how you edit the patch that is loaded right now: dump it, change what \
+the user asked for, then sync it back. Read-only with respect to the device.")]
+    pub async fn dump(
+        &self,
+        Parameters(args): Parameters<DumpArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let d = self.device.clone();
+        blocking(move || d.dump(&args.area)).await
+    }
+
+    #[tool(description = "\
+Write a document to the connected device. The document may be partial (it is merged \
+over the factory default) and may use value names (resolved automatically). \
+\n\nBy default this writes only the device's working memory: audible immediately, \
+discarded on a power cycle. Pass `verify` to read it back and confirm. \
+\n\nPass `store` ONLY when the user explicitly asked to save to a slot — it \
+permanently overwrites that saved slot. Prefer syncing without `store` so the user \
+can audition the sound first.")]
+    pub async fn sync(
+        &self,
+        Parameters(args): Parameters<SyncArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let d = self.device.clone();
+        blocking(move || {
+            d.sync(
+                &args.area,
+                &args.document,
+                args.verify.unwrap_or(false),
+                args.store.as_deref(),
+            )
+        })
+        .await
+    }
 }
 
 // `router = self.tool_router` reuses the router built in `new`; the macro's
@@ -229,6 +332,17 @@ impl ServerHandler for MidiAccessServer {
     fn get_info(&self) -> InitializeResult {
         let d = &self.device;
         let areas: Vec<&str> = d.areas().iter().map(|a| a.name).collect();
+        let io_hint = if d.midi().read_only {
+            "This server is read-only: `dump` works, but it will not write to the device."
+        } else if d.midi().input_port.is_none() {
+            "No MIDI port is configured, so `dump`/`sync` are unavailable; run \
+             `list_ports` and restart the server with --port."
+        } else {
+            "`dump` reads the device's current state and `sync` writes it back — that is \
+             how you edit the patch the user has loaded right now. `sync` touches working \
+             memory only, which a power cycle discards; pass `store` solely when the user \
+             asks to save to a slot, since that overwrites it permanently."
+        };
         let capabilities = ServerCapabilities::builder()
             .enable_tools()
             .enable_resources()
@@ -245,8 +359,7 @@ impl ServerHandler for MidiAccessServer {
                  `get_catalog` to choose values *by name*, call `resolve_names` to turn \
                  those names into numbers, then `validate` to confirm it encodes. \
                  `schema://<area>` gives the JSON Schema.\n\n\
-                 This server is read-only and never touches hardware; send the finished \
-                 YAML to the device with the `{name}` CLI.",
+                 {io_hint}",
                 name = d.name(),
                 areas = areas.join(", "),
             ))
@@ -410,7 +523,7 @@ mod tests {
     }
 
     #[test]
-    fn router_exposes_the_five_authoring_tools() {
+    fn router_exposes_the_authoring_and_device_io_tools() {
         let tools = MidiAccessServer::tool_router().list_all();
         let mut names: Vec<&str> = tools.iter().map(|t| t.name.as_ref()).collect();
         names.sort_unstable();
@@ -418,10 +531,13 @@ mod tests {
             names,
             [
                 "describe_device",
+                "dump",
                 "get_catalog",
+                "list_ports",
                 "resolve_names",
                 "search_params",
-                "validate"
+                "sync",
+                "validate",
             ]
         );
         // Every tool carries a description and an input schema for the client.
@@ -543,7 +659,8 @@ mod tests {
         assert!(info.capabilities.resources.is_some());
         let instr = info.instructions.unwrap();
         assert!(instr.contains("fake"));
-        assert!(instr.contains("read-only"));
+        // With no port configured, the handshake says so up front.
+        assert!(instr.contains("No MIDI port is configured"));
     }
 
     /// End-to-end over the real protocol: a client on one end of an in-memory
@@ -565,11 +682,15 @@ mod tests {
         // The handshake carried our device-specific server info + instructions.
         let info = client.peer_info().expect("server info");
         assert_eq!(info.server_info.name, "fake-mcp");
-        assert!(info.instructions.as_ref().unwrap().contains("read-only"));
+        assert!(info
+            .instructions
+            .as_ref()
+            .unwrap()
+            .contains("No MIDI port is configured"));
 
         // tools/list
         let tools = client.list_tools(Default::default()).await.unwrap();
-        assert_eq!(tools.tools.len(), 5);
+        assert_eq!(tools.tools.len(), 8);
 
         // tools/call — resolve a value name through the real dispatch path.
         let args = serde_json::json!({ "document": "n: seven" })
@@ -614,5 +735,75 @@ mod tests {
 
         let ok = s.describe_device().await.unwrap();
         assert_ne!(ok.is_error, Some(true));
+    }
+    #[test]
+    fn device_io_without_a_port_reports_how_to_fix_it() {
+        // No MidiConfig: `dump`/`sync` must explain themselves rather than hang or
+        // open some arbitrary port.
+        let h = handle();
+        let e = h.dump("system").unwrap_err();
+        assert!(e.contains("no MIDI port configured"), "{e}");
+        assert!(e.contains("list_ports"), "should point at the fix: {e}");
+
+        let e = h.sync("system", "n: 1", false, None).unwrap_err();
+        assert!(e.contains("no MIDI port configured"), "{e}");
+    }
+
+    #[test]
+    fn read_only_refuses_sync_before_touching_midi() {
+        let h = handle().with_midi(MidiConfig {
+            input_port: Some("nonexistent".into()),
+            output_port: Some("nonexistent".into()),
+            device: 0,
+            read_only: true,
+        });
+        let e = h.sync("system", "n: 1", false, None).unwrap_err();
+        assert!(e.contains("read-only"), "{e}");
+        // Reads are still allowed (this one fails on the bogus port, not on policy).
+        assert!(!h.dump("system").unwrap_err().contains("read-only"));
+    }
+
+    #[test]
+    fn sync_validates_the_area_and_document_before_opening_a_port() {
+        let h = handle().with_midi(MidiConfig {
+            input_port: Some("nonexistent".into()),
+            output_port: Some("nonexistent".into()),
+            ..MidiConfig::default()
+        });
+        // Bad area and bad YAML must be caught without any MIDI traffic.
+        assert!(h
+            .sync("bogus", "n: 1", false, None)
+            .unwrap_err()
+            .contains("unknown area"));
+        assert!(h
+            .sync("system", "n: [unclosed", false, None)
+            .unwrap_err()
+            .contains("YAML"));
+    }
+
+    #[test]
+    fn get_info_describes_the_io_posture() {
+        let offline = MidiAccessServer::new(handle()).get_info();
+        assert!(offline
+            .instructions
+            .unwrap()
+            .contains("No MIDI port is configured"));
+
+        let ro = MidiAccessServer::new(handle().with_midi(MidiConfig {
+            read_only: true,
+            ..MidiConfig::default()
+        }))
+        .get_info();
+        assert!(ro.instructions.unwrap().contains("read-only"));
+
+        let live = MidiAccessServer::new(handle().with_midi(MidiConfig {
+            input_port: Some("CK".into()),
+            output_port: Some("CK".into()),
+            ..MidiConfig::default()
+        }))
+        .get_info();
+        let i = live.instructions.unwrap();
+        assert!(i.contains("`dump` reads"));
+        assert!(i.contains("overwrites it permanently"));
     }
 }

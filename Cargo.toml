@@ -11,6 +11,7 @@ description = "Shared foundation for a family of MIDI-device access crates: a ge
 
 [workspace.dependencies]
 midi-access-core = { path = "midi-access-core" }
+midi-access-cli = { path = "midi-access-cli" }
 thiserror = "1"
 serde = { version = "1", features = ["derive"] }
 serde_yaml = "0.9"
