@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["midi-access-core", "midi-access-cli"]
+members = ["midi-access-core", "midi-access-cli", "midi-access-mcp"]
 
 [workspace.package]
 version = "0.1.0"
