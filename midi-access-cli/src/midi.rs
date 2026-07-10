@@ -36,23 +36,38 @@ fn open_err(e: impl std::fmt::Display) -> MidiError {
     MidiError::Open(e.to_string())
 }
 
-/// Print the available input and output ports to stdout.
-pub fn list_ports() -> Result<(), MidiError> {
+/// Enumerate the available `(inputs, outputs)` port names.
+///
+/// Returns them rather than printing: an MCP server speaks JSON-RPC on stdout, so
+/// anything written there would corrupt the protocol stream.
+pub fn port_names() -> Result<(Vec<String>, Vec<String>), MidiError> {
     let mi = MidiInput::new("midi-access-list-in").map_err(open_err)?;
     let mo = MidiOutput::new("midi-access-list-out").map_err(open_err)?;
+    let name_of =
+        |n: Result<String, midir::PortInfoError>| n.unwrap_or_else(|_| "<unknown>".into());
+    let inputs = mi
+        .ports()
+        .iter()
+        .map(|p| name_of(mi.port_name(p)))
+        .collect();
+    let outputs = mo
+        .ports()
+        .iter()
+        .map(|p| name_of(mo.port_name(p)))
+        .collect();
+    Ok((inputs, outputs))
+}
+
+/// Print the available input and output ports to stdout (the CLI's `ports`).
+pub fn list_ports() -> Result<(), MidiError> {
+    let (inputs, outputs) = port_names()?;
     println!("Input ports:");
-    for p in mi.ports() {
-        println!(
-            "  - {}",
-            mi.port_name(&p).unwrap_or_else(|_| "<unknown>".into())
-        );
+    for p in inputs {
+        println!("  - {p}");
     }
     println!("\nOutput ports:");
-    for p in mo.ports() {
-        println!(
-            "  - {}",
-            mo.port_name(&p).unwrap_or_else(|_| "<unknown>".into())
-        );
+    for p in outputs {
+        println!("  - {p}");
     }
     Ok(())
 }

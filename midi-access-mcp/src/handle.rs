@@ -12,10 +12,47 @@
 //!
 //! Everything here is pure — no MIDI port is ever opened.
 
+use std::time::Duration;
+
 use serde_json::{json, Value as Json};
 use serde_yaml::Value as Yaml;
 
+use midi_access_cli::midi::MidiSession;
 use midi_access_core::{Area, Device, DeviceError, Params};
+
+/// How long to wait for the first reply, and for the stream to go idle.
+const OVERALL: Duration = Duration::from_millis(2500);
+const SETTLE: Duration = Duration::from_millis(600);
+
+/// How the server reaches the hardware. Without a port, the device-I/O tools
+/// (`list_ports` aside) report that no port is configured.
+#[derive(Clone, Debug, Default)]
+pub struct MidiConfig {
+    pub input_port: Option<String>,
+    pub output_port: Option<String>,
+    /// Device / channel number (0..=15).
+    pub device: u8,
+    /// Refuse `sync` (and therefore storing). Reads stay available.
+    pub read_only: bool,
+}
+
+impl MidiConfig {
+    fn ports(&self) -> Result<(&str, &str), String> {
+        match (self.input_port.as_deref(), self.output_port.as_deref()) {
+            (Some(i), Some(o)) => Ok((i, o)),
+            _ => Err(
+                "no MIDI port configured — start the server with --port <SUBSTRING> \
+                      (run the `list_ports` tool to see what is connected)"
+                    .to_string(),
+            ),
+        }
+    }
+
+    fn open(&self) -> Result<MidiSession, String> {
+        let (i, o) = self.ports()?;
+        MidiSession::open_with(i, o, self.device).map_err(|e| e.to_string())
+    }
+}
 
 /// A device's reference data plus the few behaviours the MCP tools need.
 #[derive(Clone)]
@@ -34,9 +71,108 @@ pub struct DeviceHandle {
     resolve: fn(&mut Yaml),
     accepts: fn(&str, &Yaml) -> bool,
     encode: fn(&str, &Yaml, u8) -> Result<Vec<u8>, DeviceError>,
+    request: fn(&str, u8) -> Result<Vec<u8>, DeviceError>,
+    decode: fn(&str, &[u8]) -> Result<Yaml, DeviceError>,
+    store: StoreFn,
+
+    midi: MidiConfig,
 }
 
+/// `Device::store`, as a function pointer: `None` for devices with no store step,
+/// `Some(Err(..))` when the destination is bad.
+type StoreFn = fn(&str, &Yaml, &str, u8) -> Option<Result<Vec<u8>, DeviceError>>;
+
 impl DeviceHandle {
+    /// Attach a MIDI configuration, enabling the device-I/O tools.
+    pub fn with_midi(mut self, midi: MidiConfig) -> Self {
+        self.midi = midi;
+        self
+    }
+
+    pub fn midi(&self) -> &MidiConfig {
+        &self.midi
+    }
+
+    /// Read `area` off the device and return it as a YAML document.
+    ///
+    /// Blocking: call from `spawn_blocking`.
+    pub fn dump(&self, area: &str) -> Result<String, String> {
+        let area = self.canon(area).ok_or_else(|| self.unknown_area())?;
+        let mut s = self.midi.open()?;
+        let req = (self.request)(area, self.midi.device).map_err(|e| e.to_string())?;
+        let raw = s
+            .request_collect(&req, SETTLE, OVERALL)
+            .map_err(|e| e.to_string())?;
+        if raw.is_empty() {
+            return Err(format!(
+                "no dump received for {area:?} — check the device number and that its \
+                 MIDI In/Out are enabled"
+            ));
+        }
+        let doc = (self.decode)(area, &raw).map_err(|e| e.to_string())?;
+        serde_yaml::to_string(&doc).map_err(|e| e.to_string())
+    }
+
+    /// Write `document` to `area` in the device's working memory, optionally
+    /// reading it back to confirm, and optionally committing it to `store`.
+    ///
+    /// Blocking: call from `spawn_blocking`.
+    pub fn sync(
+        &self,
+        area: &str,
+        document: &str,
+        verify: bool,
+        store: Option<&str>,
+    ) -> Result<Json, String> {
+        if self.midi.read_only {
+            return Err("this server was started read-only; `sync` is disabled".into());
+        }
+        let area = self.canon(area).ok_or_else(|| self.unknown_area())?;
+        let ch = self.midi.device;
+
+        let mut doc: Yaml = serde_yaml::from_str(document).map_err(|e| format!("YAML: {e}"))?;
+        // Names are an input-only convenience, exactly as in the CLI.
+        (self.resolve)(&mut doc);
+        let bytes = (self.encode)(area, &doc, ch).map_err(|e| e.to_string())?;
+
+        let mut s = self.midi.open()?;
+        s.send_sysex(&bytes).map_err(|e| e.to_string())?;
+        let mut out = json!({ "area": area, "sent_bytes": bytes.len(), "verified": false });
+
+        if verify {
+            std::thread::sleep(Duration::from_millis(80));
+            let want = (self.decode)(area, &bytes).map_err(|e| e.to_string())?;
+            let req = (self.request)(area, ch).map_err(|e| e.to_string())?;
+            let raw = s
+                .request_collect(&req, SETTLE, OVERALL)
+                .map_err(|e| e.to_string())?;
+            let got = (self.decode)(area, &raw).map_err(|e| e.to_string())?;
+            if got != want {
+                return Err(
+                    "verify FAILED: the device read back differently from what was sent"
+                        .to_string(),
+                );
+            }
+            out["verified"] = json!(true);
+        }
+
+        if let Some(dest) = store {
+            match (self.store)(area, &doc, dest, ch) {
+                None => return Err(format!("device {:?} has no store operation", self.name)),
+                Some(Err(e)) => return Err(e.to_string()),
+                Some(Ok(frames)) => {
+                    s.send_sysex(&frames).map_err(|e| e.to_string())?;
+                    out["stored_to"] = json!(dest);
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    fn unknown_area(&self) -> String {
+        format!("unknown area (valid: {})", self.area_names().join(", "))
+    }
+
     /// Snapshot `D`. Computes the catalogs, schemas, and defaults once.
     pub fn of<D: Device>() -> Self {
         let areas = D::areas();
@@ -72,6 +208,10 @@ impl DeviceHandle {
             resolve: |v| midi_access_core::resolve_names(v, D::params(), D::catalogs()),
             accepts: D::accepts,
             encode: D::encode,
+            request: D::request,
+            decode: D::decode,
+            store: D::store,
+            midi: MidiConfig::default(),
         }
     }
 

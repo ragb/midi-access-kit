@@ -165,9 +165,35 @@ The authoring loop is: `describe_device` → `search_params` → write YAML *by 
 byte-encodes through the real codec, so it catches out-of-range values a JSON
 Schema alone would not.
 
-**The server is read-only.** It never opens a MIDI port. Sending a preset to a
-device — and especially storing it, which permanently overwrites a saved slot —
-stays in the CLI, where a human runs it deliberately.
+### Talking to the hardware
+
+Give the server a port and it gains three more tools:
+
+| Tool | Purpose |
+|------|---------|
+| `list_ports` | Enumerate MIDI ports. |
+| `dump` | Read an area off the device — how you edit *the patch loaded right now*. |
+| `sync` | Write a document back, optionally `verify`ing the read-back. |
+
+```rust
+// mydev/src/bin/mcp.rs
+midi_access_mcp::serve_with::<MyDevice>(MidiConfig {
+    input_port: Some("CK Series".into()),
+    output_port: Some("CK Series".into()),
+    device: 0,
+    read_only: false,
+})
+```
+
+**`sync` writes working memory by default** — audible immediately, discarded on a
+power cycle. Committing to a saved slot is a separate, explicit `store` argument,
+because it overwrites that slot for good; the tool description tells the model to
+set it only when the user asked. `read_only: true` refuses writes entirely while
+leaving `dump` available.
+
+> An MCP stdio server must never write to stdout — that's the JSON-RPC channel.
+> Hence `midi::port_names()` (which returns) alongside the CLI's `list_ports`
+> (which prints).
 
 ## Status / exit codes
 

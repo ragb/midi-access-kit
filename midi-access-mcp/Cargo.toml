@@ -8,6 +8,7 @@ description = "Generic MCP server for MIDI device access crates: implement Devic
 
 [dependencies]
 midi-access-core = { workspace = true }
+midi-access-cli = { workspace = true }
 # The official Model Context Protocol Rust SDK (server + macros + stdio transport).
 rmcp = { version = "2", features = ["server", "macros", "transport-io"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-std", "io-util"] }
