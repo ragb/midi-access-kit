@@ -23,6 +23,9 @@ use midi_access_core::{Area, Device, DeviceError, Params};
 /// How long to wait for the first reply, and for the stream to go idle.
 const OVERALL: Duration = Duration::from_millis(2500);
 const SETTLE: Duration = Duration::from_millis(600);
+/// Pause after a `sync` write, before a `store`, so the device finishes applying
+/// the (possibly multi-block) dump before it commits to flash.
+const STORE_SETTLE: Duration = Duration::from_millis(500);
 
 /// How the server reaches the hardware. Without a port, the device-I/O tools
 /// (`list_ports` aside) report that no port is configured.
@@ -161,6 +164,12 @@ impl DeviceHandle {
                 None => return Err(format!("device {:?} has no store operation", self.name)),
                 Some(Err(e)) => return Err(e.to_string()),
                 Some(Ok(frames)) => {
+                    // Let the device finish applying the dump before committing
+                    // to flash — a store that races the dump's finalization can
+                    // save an incomplete or just-cleared buffer, corrupting the
+                    // target slot. (`verify` above already waited; this covers
+                    // the common no-verify path.)
+                    std::thread::sleep(STORE_SETTLE);
                     s.send_sysex(&frames).map_err(|e| e.to_string())?;
                     out["stored_to"] = json!(dest);
                 }
