@@ -94,22 +94,40 @@ pub async fn serve_async<D: Device>(midi: MidiConfig) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Run a blocking MIDI operation off the async runtime, mapping either failure
-/// into a tool-level error the caller can read.
-async fn blocking<T, F>(f: F) -> Result<CallToolResult, McpError>
+/// Run a blocking MIDI operation off the async runtime, turning its result into a
+/// `CallToolResult` via `ok`, and either failure into a tool-level error the
+/// caller can read.
+async fn blocking<T, F>(
+    f: F,
+    ok: impl FnOnce(T) -> CallToolResult,
+) -> Result<CallToolResult, McpError>
 where
-    T: serde::Serialize + Send + 'static,
+    T: Send + 'static,
     F: FnOnce() -> Result<T, String> + Send + 'static,
 {
     match tokio::task::spawn_blocking(f).await {
-        Ok(Ok(v)) => Ok(CallToolResult::structured(
-            serde_json::to_value(v).unwrap_or(serde_json::Value::Null),
-        )),
+        Ok(Ok(v)) => Ok(ok(v)),
         Ok(Err(e)) => Ok(CallToolResult::error(vec![ContentBlock::text(e)])),
         Err(join) => Ok(CallToolResult::error(vec![ContentBlock::text(format!(
             "MIDI task panicked: {join}"
         ))])),
     }
+}
+
+/// A structured (object) result. MCP requires `structuredContent` to be an
+/// object, so anything that is not one is returned as text instead — a bare JSON
+/// string there fails a strict client's schema validation.
+fn structured(v: serde_json::Value) -> CallToolResult {
+    if v.is_object() {
+        CallToolResult::structured(v)
+    } else {
+        CallToolResult::success(vec![ContentBlock::text(v.to_string())])
+    }
+}
+
+/// A plain-text result — for tools whose payload is a document, not a record.
+fn text(s: String) -> CallToolResult {
+    CallToolResult::success(vec![ContentBlock::text(s)])
 }
 
 // === tool arguments ===
@@ -209,7 +227,7 @@ Describe this MIDI device: its name, editable areas (each dumpable/syncable as o
 document), the parameter display groups, and the names of its value catalogs. Call \
 this first to orient yourself before searching parameters or authoring a preset.")]
     pub async fn describe_device(&self) -> Result<CallToolResult, McpError> {
-        Ok(CallToolResult::structured(self.device.describe()))
+        Ok(structured(self.device.describe()))
     }
 
     #[tool(description = "\
@@ -221,7 +239,7 @@ if any). Use this instead of trying to load the whole catalog.")]
         &self,
         Parameters(args): Parameters<SearchParamsArgs>,
     ) -> Result<CallToolResult, McpError> {
-        Ok(CallToolResult::structured(self.device.search_params(
+        Ok(structured(self.device.search_params(
             args.query.as_deref(),
             args.group.as_deref(),
             args.limit.unwrap_or(50),
@@ -243,7 +261,7 @@ large — filter rather than paging through everything.")]
             args.limit.unwrap_or(50),
             args.offset.unwrap_or(0),
         ) {
-            Ok(v) => Ok(CallToolResult::structured(v)),
+            Ok(v) => Ok(structured(v)),
             Err(e) => Ok(CallToolResult::error(vec![ContentBlock::text(e)])),
         }
     }
@@ -283,13 +301,14 @@ call this, then validate.")]
 List the MIDI input and output ports on this machine. Use it to find the device's \
 port name if `dump`/`sync` report that no port is configured.")]
     pub async fn list_ports(&self) -> Result<CallToolResult, McpError> {
-        blocking(|| {
-            midi_access_cli::midi::port_names()
-                .map(
-                    |(inputs, outputs)| serde_json::json!({ "inputs": inputs, "outputs": outputs }),
-                )
-                .map_err(|e| e.to_string())
-        })
+        blocking(
+            || {
+                midi_access_cli::midi::port_names()
+                    .map(|(i, o)| serde_json::json!({ "inputs": i, "outputs": o }))
+                    .map_err(|e| e.to_string())
+            },
+            structured,
+        )
         .await
     }
 
@@ -304,7 +323,8 @@ factory default and would reset everything else. Read-only with respect to the d
         Parameters(args): Parameters<DumpArgs>,
     ) -> Result<CallToolResult, McpError> {
         let d = self.device.clone();
-        blocking(move || d.dump(&args.area)).await
+        // A YAML document, not a record: return it as text.
+        blocking(move || d.dump(&args.area), text).await
     }
 
     #[tool(description = "\
@@ -326,14 +346,17 @@ can audition the sound first.")]
         Parameters(args): Parameters<SyncArgs>,
     ) -> Result<CallToolResult, McpError> {
         let d = self.device.clone();
-        blocking(move || {
-            d.sync(
-                &args.area,
-                &args.document,
-                args.verify.unwrap_or(false),
-                args.store.as_deref(),
-            )
-        })
+        blocking(
+            move || {
+                d.sync(
+                    &args.area,
+                    &args.document,
+                    args.verify.unwrap_or(false),
+                    args.store.as_deref(),
+                )
+            },
+            structured,
+        )
         .await
     }
 }
@@ -818,5 +841,80 @@ mod tests {
         let i = live.instructions.unwrap();
         assert!(i.contains("`dump` reads"));
         assert!(i.contains("overwrites it permanently"));
+    }
+    /// MCP requires `structuredContent` to be an OBJECT. A strict client rejects a
+    /// bare JSON string there — which is exactly how `dump` (a YAML document, not a
+    /// record) broke against a real client while a hand-rolled harness saw nothing.
+    #[tokio::test]
+    async fn every_tool_result_has_object_or_absent_structured_content() {
+        fn check(name: &str, r: &CallToolResult) {
+            if let Some(sc) = &r.structured_content {
+                assert!(
+                    sc.is_object(),
+                    "{name}: structuredContent must be an object, got {sc}"
+                );
+            }
+        }
+        let s = MidiAccessServer::new(handle());
+
+        check("describe_device", &s.describe_device().await.unwrap());
+        check(
+            "search_params",
+            &s.search_params(Parameters(SearchParamsArgs {
+                query: None,
+                group: None,
+                limit: None,
+            }))
+            .await
+            .unwrap(),
+        );
+        check(
+            "get_catalog",
+            &s.get_catalog(Parameters(GetCatalogArgs {
+                name: "nums".into(),
+                filter: None,
+                limit: None,
+                offset: None,
+            }))
+            .await
+            .unwrap(),
+        );
+        check(
+            "validate",
+            &s.validate(Parameters(ValidateArgs {
+                area: "system".into(),
+                document: "n: 1".into(),
+            }))
+            .await
+            .unwrap(),
+        );
+        check(
+            "resolve_names",
+            &s.resolve_names(Parameters(ResolveNamesArgs {
+                document: "n: seven".into(),
+            }))
+            .await
+            .unwrap(),
+        );
+        // `dump` yields a YAML document: it must come back as text, never as a
+        // JSON-string `structuredContent`.
+        let d = s
+            .dump(Parameters(DumpArgs {
+                area: "system".into(),
+            }))
+            .await
+            .unwrap();
+        check("dump", &d);
+    }
+
+    #[test]
+    fn structured_guard_demotes_non_objects_to_text() {
+        assert!(structured(serde_json::json!({"a": 1}))
+            .structured_content
+            .is_some());
+        // A bare string would be invalid structuredContent — it becomes text.
+        let s = structured(serde_json::json!("just a string"));
+        assert!(s.structured_content.is_none());
+        assert!(!s.content.is_empty());
     }
 }
