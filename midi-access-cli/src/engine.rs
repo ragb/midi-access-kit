@@ -67,7 +67,11 @@ enum Command {
         #[arg(short = 'o', long)]
         output: PathBuf,
     },
-    /// Send a YAML file's settings to the device.
+    /// Send a YAML file's settings to the device's working memory.
+    ///
+    /// On many devices this writes a volatile edit buffer — audible immediately
+    /// but lost on a power cycle. Add `--store` to also commit it to persistent
+    /// storage (the panel "Store" button), for devices that support it.
     Sync {
         area: String,
         #[arg(short = 'i', long)]
@@ -75,6 +79,11 @@ enum Command {
         /// After writing, read back and confirm it matches.
         #[arg(long)]
         verify: bool,
+        /// After writing, commit to persistent storage so it survives a power
+        /// cycle. Takes an optional device-specific destination (e.g. a preset
+        /// slot `20-8`); omit the value to store in place.
+        #[arg(long, value_name = "DEST")]
+        store: Option<Option<String>>,
     },
     /// Pretty-print a YAML file, identifying its kind (no device needed).
     Show { path: PathBuf },
@@ -149,8 +158,9 @@ fn dispatch<D: Device>(cli: Cli) -> i32 {
             area,
             input,
             verify,
+            store,
         } => with_session(&out, &session_args, |s| {
-            sync::<D>(&out, s, &area, &input, verify)
+            sync::<D>(&out, s, &area, &input, verify, store.as_ref())
         }),
         Command::Show { path } => show::<D>(&path),
         Command::Lint { path } => lint::<D>(&out, &path),
@@ -314,7 +324,14 @@ fn dump<D: Device>(out: &Out, s: &mut MidiSession, area: &str, output: &Path) ->
     }
 }
 
-fn sync<D: Device>(out: &Out, s: &mut MidiSession, area: &str, input: &Path, verify: bool) -> i32 {
+fn sync<D: Device>(
+    out: &Out,
+    s: &mut MidiSession,
+    area: &str,
+    input: &Path,
+    verify: bool,
+    store: Option<&Option<String>>,
+) -> i32 {
     let area = match area_name::<D>(out, area) {
         Ok(a) => a,
         Err(c) => return c,
@@ -340,6 +357,32 @@ fn sync<D: Device>(out: &Out, s: &mut MidiSession, area: &str, input: &Path, ver
         return DEVICE_UNAVAILABLE;
     }
     out.info(format!("sent {area} from {}", input.display()));
+
+    if let Some(dest) = store {
+        let dest = dest.as_deref().unwrap_or("");
+        match D::store(dest, s.device) {
+            None => {
+                out.error(format!("device {:?} has no --store operation", D::NAME));
+                return USAGE_ERROR;
+            }
+            Some(Err(e)) => {
+                out.error(format!("{e}"));
+                return dev_err_code(&e);
+            }
+            Some(Ok(bytes)) => {
+                if let Err(e) = s.send_sysex(&bytes) {
+                    out.error(format!("{e}"));
+                    return DEVICE_UNAVAILABLE;
+                }
+                let where_ = if dest.is_empty() {
+                    "in place".to_string()
+                } else {
+                    format!("to {dest}")
+                };
+                out.info(format!("  stored {where_} (persists across power cycle)"));
+            }
+        }
+    }
 
     if verify {
         std::thread::sleep(Duration::from_millis(80));

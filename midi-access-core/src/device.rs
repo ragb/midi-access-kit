@@ -116,6 +116,22 @@ pub trait Device {
     /// device `ch` (header + blocks + footer as needed).
     fn encode(area: &str, doc: &Value, ch: u8) -> Result<Vec<u8>, DeviceError>;
 
+    /// SysEx bytes that commit the device's working memory to persistent
+    /// storage — the panel "Store" equivalent, sent *after* [`encode`] has
+    /// written the (often volatile) working state. `dest` is an opaque,
+    /// device-specific destination (e.g. a preset slot like `"20-8"`; an empty
+    /// string means "store in place").
+    ///
+    /// Returns `None` when the device has no separate store step — a plain
+    /// [`sync`](crate) already persists — which is the default. Devices whose
+    /// `encode` only writes a volatile edit buffer override this so that
+    /// `sync --store` can make the change survive a power cycle.
+    ///
+    /// [`encode`]: Device::encode
+    fn store(_dest: &str, _ch: u8) -> Option<Result<Vec<u8>, DeviceError>> {
+        None
+    }
+
     /// Classify an inbound MIDI byte sequence.
     fn classify_inbound(bytes: &[u8]) -> Inbound;
 
