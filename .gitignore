@@ -1,2 +1,5 @@
 /target
 Cargo.lock
+
+# Local MCP server registration: machine-specific absolute paths and port names.
+.mcp.json
