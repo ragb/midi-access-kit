@@ -13,6 +13,7 @@ The kit is two crates:
 |-------|-----------|----------|
 | **`midi-access-core`** | Pure library — the `Device` trait, parameter metadata, catalogs, name resolution, deep-merge, codec primitives, JSON Schema. No clap, no midir. Compiles for `wasm32-unknown-unknown`. | `serde`, `serde_yaml`, `thiserror` (+ optional `schemars`, `tsify-next`) |
 | **`midi-access-cli`** | The generic CLI engine: `run::<D>()` builds the standard command set and dispatches through your `Device`. | `clap`, `midir`, `anyhow`, `midi-access-core` |
+| **`midi-access-mcp`** | The generic MCP server: `serve::<D>()` exposes the device's metadata to an LLM over the Model Context Protocol, so it can author presets *by name*. Read-only. | `rmcp`, `tokio`, `midi-access-core` |
 
 The document lingua franca between a device and the engine is
 `serde_yaml::Value`: a device decodes a raw dump into a `Value` and encodes a
@@ -125,6 +126,48 @@ renders a typed area model's JSON Schema (draft-07, `additionalProperties:false`
 from the model's `#[serde(deny_unknown_fields)]`). Commit the output under
 `schemas/<device>-<area>.schema.json` and a `dump`'s YAML header points editors at
 it; a CI step can regenerate and diff to catch drift.
+
+## Authoring presets with an LLM (`midi-access-mcp`)
+
+The same `Device` impl also gets you an MCP server, so an assistant can author
+presets grounded in the device's own metadata rather than guessing:
+
+```rust
+// mydev/src/bin/mcp.rs
+fn main() -> anyhow::Result<()> { midi_access_mcp::serve::<MyDevice>() }
+```
+
+The device is fixed at compile time, so a client configures **one instance per
+device** and never has to disambiguate which one a call meant:
+
+```json
+{ "mcpServers": {
+    "ck":    { "command": "ck-mcp" },
+    "re202": { "command": "re202-mcp" }
+}}
+```
+
+A catalog bundle is large (the CK's is ~110 KB), so it is exposed as something to
+*query*, never to dump into a context window:
+
+| Tool | Purpose |
+|------|---------|
+| `describe_device` | Name, areas, param groups, catalog names. The orienting call. |
+| `search_params` | Full-text over path/label/group/help — the retrieval index. |
+| `get_catalog` | One catalog's entries, filtered and paged. |
+| `validate` | Parse + byte-encode a document, returning the error. Ground truth. |
+| `resolve_names` | Value names → numbers, yielding codec-ready YAML. |
+
+Plus two resources, `schema://{area}` and `defaults://{area}`.
+
+The authoring loop is: `describe_device` → `search_params` → write YAML *by name*
+→ `resolve_names` → `validate` → iterate. `validate` is what closes it: it
+byte-encodes through the real codec, so it catches out-of-range values a JSON
+Schema alone would not.
+
+**The server is read-only.** It never opens a MIDI port. Sending a preset to a
+device — and especially storing it, which permanently overwrites a saved slot —
+stays in the CLI, where a human runs it deliberately.
 
 ## Status / exit codes
 

@@ -1,0 +1,25 @@
+[package]
+name = "midi-access-mcp"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Generic MCP server for MIDI device access crates: implement Device, call serve::<D>()."
+
+[dependencies]
+midi-access-core = { workspace = true }
+# The official Model Context Protocol Rust SDK (server + macros + stdio transport).
+rmcp = { version = "2", features = ["server", "macros", "transport-io"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-std", "io-util"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_yaml = { workspace = true }
+anyhow = { workspace = true }
+
+[dev-dependencies]
+# The MCP *client* half, so the tests can drive a real protocol round-trip
+# (initialize / tools/list / tools/call / resources/read) over an in-memory duplex.
+rmcp = { version = "2", features = ["client"] }
+# NOTE: no direct `schemars` dep. The kit pins schemars 0.8 (for `schema_json`),
+# while rmcp needs 1.x for tool-argument schemas. Derive tool args via the
+# `rmcp::schemars` re-export so the two majors never get crossed.
