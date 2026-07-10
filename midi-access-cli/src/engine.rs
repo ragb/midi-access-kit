@@ -360,7 +360,7 @@ fn sync<D: Device>(
 
     if let Some(dest) = store {
         let dest = dest.as_deref().unwrap_or("");
-        match D::store(dest, s.device) {
+        match D::store(area, &value, dest, s.device) {
             None => {
                 out.error(format!("device {:?} has no --store operation", D::NAME));
                 return USAGE_ERROR;
@@ -710,6 +710,61 @@ mod tests {
         fn classify_inbound(bytes: &[u8]) -> Inbound {
             Inbound::Other(bytes.to_vec())
         }
+
+        /// A *copy-to-slot* store (the Roland shape): no save command exists, so
+        /// committing re-writes the document's own bytes at the slot's address.
+        /// Exercises `store` receiving `area` + `doc`.
+        fn store(
+            area: &str,
+            doc: &Value,
+            dest: &str,
+            _ch: u8,
+        ) -> Option<Result<Vec<u8>, DeviceError>> {
+            Some((|| {
+                if area != "system" {
+                    return Err(DeviceError::UnknownArea(area.into()));
+                }
+                let slot: u8 = dest
+                    .parse()
+                    .map_err(|_| DeviceError::Encode(format!("bad slot {dest:?}")))?;
+                let d: FakeDoc = serde_yaml::from_value(doc.clone())
+                    .map_err(|e| DeviceError::Encode(e.to_string()))?;
+                Ok(vec![0xF0, slot, d.n, 0xF7])
+            })())
+        }
+    }
+
+    /// A device with no store step at all — the default `None`.
+    struct NoStore;
+    impl Device for NoStore {
+        const NAME: &'static str = "nostore";
+        fn areas() -> &'static [Area] {
+            AREAS
+        }
+        fn params() -> Params {
+            Params(PARAMS)
+        }
+        fn catalogs() -> &'static dyn Catalogs {
+            &CATS
+        }
+        fn defaults(_: &str) -> Option<Value> {
+            None
+        }
+        fn schema(_: &str) -> Option<String> {
+            None
+        }
+        fn request(_: &str, _: u8) -> Result<Vec<u8>, DeviceError> {
+            Ok(vec![])
+        }
+        fn decode(_: &str, _: &[u8]) -> Result<Value, DeviceError> {
+            Err(DeviceError::Decode("no".into()))
+        }
+        fn encode(_: &str, _: &Value, _: u8) -> Result<Vec<u8>, DeviceError> {
+            Ok(vec![])
+        }
+        fn classify_inbound(b: &[u8]) -> Inbound {
+            Inbound::Other(b.to_vec())
+        }
     }
 
     #[test]
@@ -760,6 +815,30 @@ mod tests {
     #[test]
     fn catalog_via_try_run_succeeds() {
         assert_eq!(try_run::<Fake>(["fake", "catalog"]).unwrap(), OK);
+    }
+
+    #[test]
+    fn store_receives_the_document_for_copy_to_slot_devices() {
+        // The whole point of passing `doc`: the store frame is derived from the
+        // document's bytes, not just the destination.
+        let doc: Value = serde_yaml::from_str("n: 42").unwrap();
+        let bytes = Fake::store("system", &doc, "9", 0).unwrap().unwrap();
+        assert_eq!(bytes, vec![0xF0, 9, 42, 0xF7]);
+    }
+
+    #[test]
+    fn store_reports_bad_slot_and_bad_area() {
+        let doc: Value = serde_yaml::from_str("n: 1").unwrap();
+        assert!(Fake::store("system", &doc, "not-a-slot", 0)
+            .unwrap()
+            .is_err());
+        assert!(Fake::store("bogus", &doc, "1", 0).unwrap().is_err());
+    }
+
+    #[test]
+    fn store_defaults_to_none_when_a_device_has_no_store_step() {
+        let doc: Value = serde_yaml::from_str("n: 1").unwrap();
+        assert!(NoStore::store("system", &doc, "1", 0).is_none());
     }
 
     #[test]
